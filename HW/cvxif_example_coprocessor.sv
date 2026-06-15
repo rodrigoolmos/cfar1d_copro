@@ -7,7 +7,7 @@
 //
 // Original Author: Guillaume Chauvon
 
-module cvxif_example_coprocessor1
+module cvxif_example_coprocessor
   import cvxif_instr_pkg::*;
 #(
     // CVXIF Types

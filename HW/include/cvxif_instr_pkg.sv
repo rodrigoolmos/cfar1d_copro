@@ -76,11 +76,12 @@ package cvxif_instr_pkg;
           opcode : CFAR_SET_GUARD
       },
       '{
-          // Custom CFAR run one input sample: rs1=data_in, rd<=detection_map[7:0]
+          // Custom CFAR run one complex input sample: rs1=data_in_re, rs2=data_in_im,
+          // rd<=detection_map[7:0]
           instr:
           32'b00100_00_00000_00000_0_01_00000_1111011,  // custom3 opcode
           mask: 32'b11111_11_00000_00000_1_11_00000_1111111,
-          resp : '{accept : 1'b1, writeback : 1'b1, register_read : {1'b0, 1'b0, 1'b1}},
+          resp : '{accept : 1'b1, writeback : 1'b1, register_read : {1'b0, 1'b1, 1'b1}},
           opcode : CFAR_RUN
       }
   };

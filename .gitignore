@@ -1,0 +1,7 @@
+*/questasim
+/questasim
+*.bak
+*.log
+transcript
+/*/run.sh
+/*/run_sim.tcl

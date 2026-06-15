@@ -46,7 +46,8 @@ module copro_alu
 
   logic        cfar_reset_window;
   logic        cfar_start;
-  logic [31:0] cfar_data_in;
+  logic signed [31:0] cfar_data_in_re;
+  logic signed [31:0] cfar_data_in_im;
   logic [7:0]  cfar_detection_map_w;
   logic        cfar_done_w;
 
@@ -96,7 +97,8 @@ module copro_alu
     end
   end
 
-  assign cfar_data_in = rs1_word;
+  assign cfar_data_in_re = rs1_word;
+  assign cfar_data_in_im = rs2_word;
 
   cfar_1d #(
       .MAX_WINDOW_CELLS(CFAR_MAX_WINDOW_CELLS)
@@ -111,7 +113,8 @@ module copro_alu
       .guard_cells_right  (guard_cells_right_q),
       .start              (cfar_start),
       .done               (cfar_done_w),
-      .data_in            (cfar_data_in),
+      .data_in_re         (cfar_data_in_re),
+      .data_in_im         (cfar_data_in_im),
       .detection_map      (cfar_detection_map_w)
   );
 

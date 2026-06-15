@@ -23,6 +23,17 @@ typedef struct {
     const char *name;
 } cfar_cfg_t;
 
+typedef struct {
+    int32_t re;
+    int32_t im;
+} cfar_sample_t;
+
+#if defined(__SIZEOF_INT128__)
+typedef unsigned __int128 cfar_acc_t;
+#else
+typedef uint64_t cfar_acc_t;
+#endif
+
 static const cfar_cfg_t kCfgs[] = {
     {3u, 4u, 4u, 1u, 1u, "base"},
     {2u, 6u, 6u, 1u, 1u, "wide_train_low_alpha"},
@@ -54,7 +65,7 @@ static const uint64_t kSeeds[NSEEDS] = {
 #define NCASES ((uint32_t)(sizeof(kCfgs) / sizeof(kCfgs[0])))
 #define NTESTS (NCASES * NSEEDS)
 
-static uint32_t in[NSAMPLES];
+static cfar_sample_t in[NSAMPLES];
 static volatile uint64_t sink;
 static sigjmp_buf sigill_env;
 
@@ -111,11 +122,30 @@ static inline void cfar_hw_set_guard(uint64_t l, uint64_t r)
 {
     __asm__ __volatile__(".insn r 0x7b, 0, 12, x0, %0, %1" : : "r"(l), "r"(r) : "memory");
 }
-static inline uint8_t cfar_hw_run(uint64_t x)
+static inline uint8_t cfar_hw_run(int32_t re, int32_t im)
 {
     uint64_t rd;
-    __asm__ __volatile__(".insn r 0x7b, 1, 16, %0, %1, x0" : "=r"(rd) : "r"(x) : "memory");
+    __asm__ __volatile__(".insn r 0x7b, 1, 16, %0, %1, %2"
+                         : "=r"(rd)
+                         : "r"((int64_t)re), "r"((int64_t)im)
+                         : "memory");
     return (uint8_t)(rd & 0xffu);
+}
+
+static inline int32_t signed_10b(uint32_t v)
+{
+    return (int32_t)(v & 0x3ffu) - 512;
+}
+
+static inline uint64_t square_s32(int32_t x)
+{
+    int64_t sx = (int64_t)x;
+    return (uint64_t)(sx * sx);
+}
+
+static inline uint64_t sample_power(cfar_sample_t x)
+{
+    return square_s32(x.re) + square_s32(x.im);
 }
 
 static void sigill_handler(int signo)
@@ -170,20 +200,31 @@ static void init_input(uint64_t seed, uint32_t pattern)
         s = lcg_next(s);
         switch (pattern & 3u) {
         case 0u:
-            in[i] = (uint32_t)((s >> 16) & 0x3ffu);
+            in[i].re = signed_10b((uint32_t)(s >> 16));
+            in[i].im = signed_10b((uint32_t)(s >> 32));
             break;
         case 1u:
-            in[i] = (uint32_t)((i * 37u + (i >> 2) * 13u + (uint32_t)(seed & 0x3ffu)) & 0x3ffu);
+            in[i].re = signed_10b(i * 37u + (i >> 2) * 13u + (uint32_t)(seed & 0x3ffu));
+            in[i].im = signed_10b(i * 19u + (i >> 3) * 29u + (uint32_t)((seed >> 16) & 0x3ffu));
             break;
         case 2u: {
-            uint32_t v = (uint32_t)((s >> 20) & 0x1ffu);
-            if ((i & 31u) == 0u) v = 1023u;
-            if ((i & 127u) == 63u) v = 0u;
-            in[i] = v;
+            int32_t re = signed_10b((uint32_t)(s >> 20));
+            int32_t im = signed_10b((uint32_t)(s >> 36));
+            if ((i & 31u) == 0u) {
+                re = 1023;
+                im = -1023;
+            }
+            if ((i & 127u) == 63u) {
+                re = 0;
+                im = 0;
+            }
+            in[i].re = re;
+            in[i].im = im;
             break;
         }
         default:
-            in[i] = (i & 1u) ? 1023u : 0u;
+            in[i].re = (i & 1u) ? 1023 : -1023;
+            in[i].im = (i & 2u) ? 511 : -511;
             break;
         }
     }
@@ -194,7 +235,7 @@ static uint32_t cfg_window_size(const cfar_cfg_t *cfg)
     return cfg->tl + cfg->tr + cfg->gl + cfg->gr + 1u;
 }
 
-static uint8_t cfar_sw_step(uint32_t w[MAXW], uint32_t *wcnt, uint8_t *det, uint32_t x,
+static uint8_t cfar_sw_step(uint64_t w[MAXW], uint32_t *wcnt, uint8_t *det, cfar_sample_t x,
                             const cfar_cfg_t *cfg)
 {
     uint32_t i;
@@ -202,7 +243,7 @@ static uint8_t cfar_sw_step(uint32_t w[MAXW], uint32_t *wcnt, uint8_t *det, uint
     uint32_t cut = cfg->tr + cfg->gr;
 
     for (i = MAXW - 1u; i > 0u; --i) w[i] = w[i - 1u];
-    w[0] = x;
+    w[0] = sample_power(x);
 
     if ((*wcnt + 1u) < wsize) {
         *wcnt += 1u;
@@ -210,19 +251,19 @@ static uint8_t cfar_sw_step(uint32_t w[MAXW], uint32_t *wcnt, uint8_t *det, uint
     }
 
     {
-        uint64_t acc = 0u;
+        cfar_acc_t acc = 0u;
         uint32_t left_begin = cfg->tr + cfg->gr + 1u + cfg->gl;
         uint32_t left_end = left_begin + cfg->tl;
         uint32_t ttotal = cfg->tl + cfg->tr;
-        uint64_t avg = 0u;
-        uint64_t thr;
+        cfar_acc_t avg = 0u;
+        cfar_acc_t thr;
 
         for (i = 0; i < MAXW; ++i) {
             if ((i < cfg->tr) || ((i >= left_begin) && (i < left_end))) acc += w[i];
         }
         if (ttotal != 0u) avg = acc / ttotal;
-        thr = avg * (uint64_t)cfg->alpha;
-        *det = ((uint64_t)w[cut] > thr) ? 1u : 0u;
+        thr = avg * (cfar_acc_t)cfg->alpha;
+        *det = ((cfar_acc_t)w[cut] > thr) ? 1u : 0u;
     }
 
     return *det;
@@ -232,7 +273,7 @@ static uint64_t run_sw(const cfar_cfg_t *cfg)
 {
     uint64_t sum = 0u;
     uint32_t rep, i;
-    uint32_t w[MAXW];
+    uint64_t w[MAXW];
     for (rep = 0; rep < NREPS; ++rep) {
         uint32_t wcnt = 0u;
         uint8_t det = 0u;
@@ -251,7 +292,7 @@ static uint64_t run_hw(const cfar_cfg_t *cfg)
     cfar_hw_set_guard(cfg->gl, cfg->gr);
     for (rep = 0; rep < NREPS; ++rep) {
         cfar_hw_reset();
-        for (i = 0; i < NSAMPLES; ++i) sum = mix(sum, cfar_hw_run(in[i]));
+        for (i = 0; i < NSAMPLES; ++i) sum = mix(sum, cfar_hw_run(in[i].re, in[i].im));
     }
     return sum;
 }
