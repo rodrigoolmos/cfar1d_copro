@@ -5,13 +5,164 @@
 #include <stdint.h>
 #include <stdio.h>
 
+typedef uint32_t cfar_fp32_t;
+
+_Static_assert(sizeof(float) == sizeof(cfar_fp32_t),
+               "CFAR requires a 32-bit IEEE-754 float type");
+
+static inline cfar_fp32_t cfar_f32_bits(float value)
+{
+    union { float f; uint32_t u; } cvt;
+    cvt.f = value;
+    return cvt.u;
+}
+
+static inline cfar_fp32_t cfar_fp32_negate(cfar_fp32_t value)
+{
+    return ((value & UINT32_C(0x7fffffff)) == 0u) ? 0u :
+           (value ^ UINT32_C(0x80000000));
+}
+
+/* Bit-accurate model of HW/cfar1d/fp_mul32_lite.sv. */
+static inline cfar_fp32_t cfar_fp32_mul_lite(cfar_fp32_t a, cfar_fp32_t b)
+{
+    uint32_t sres = (a ^ b) >> 31;
+    uint32_t ea = (a >> 23) & 0xffu;
+    uint32_t eb = (b >> 23) & 0xffu;
+    uint32_t a_zero = (ea == 0u);
+    uint32_t b_zero = (eb == 0u);
+    uint32_t a_special = (ea == 0xffu);
+    uint32_t b_special = (eb == 0xffu);
+    uint32_t ma, mb, mres;
+    uint64_t product, normalised;
+    int32_t eres;
+
+    if (a_special || b_special) {
+        if (a_zero || b_zero) return 0u;
+        return (sres << 31) | UINT32_C(0x7f7fffff);
+    }
+    if (a_zero || b_zero) return 0u;
+
+    ma = UINT32_C(0x800000) | (a & UINT32_C(0x7fffff));
+    mb = UINT32_C(0x800000) | (b & UINT32_C(0x7fffff));
+    product = (uint64_t)ma * (uint64_t)mb;
+    eres = (int32_t)ea + (int32_t)eb - 127;
+    if ((product & (UINT64_C(1) << 47)) != 0u) {
+        normalised = product >> 1;
+        ++eres;
+    } else {
+        normalised = product;
+    }
+    mres = (uint32_t)((normalised >> 23) & UINT64_C(0xffffff));
+    if ((eres <= 0) || (mres == 0u)) return 0u;
+    if (eres >= 255) return (sres << 31) | UINT32_C(0x7f7fffff);
+    return (sres << 31) | ((uint32_t)eres << 23) | (mres & UINT32_C(0x7fffff));
+}
+
+/* Bit-accurate model of HW/cfar1d/fp_addsub32_lite.sv. */
+static inline cfar_fp32_t cfar_fp32_addsub_lite(
+    cfar_fp32_t a, cfar_fp32_t b, uint32_t subtract)
+{
+    uint32_t sa = a >> 31;
+    uint32_t sb = b >> 31;
+    uint32_t sbe = sb ^ (subtract & 1u);
+    uint32_t ea = (a >> 23) & 0xffu;
+    uint32_t eb = (b >> 23) & 0xffu;
+    uint32_t a_zero = (ea == 0u);
+    uint32_t b_zero = (eb == 0u);
+    uint32_t a_special = (ea == 0xffu);
+    uint32_t b_special = (eb == 0xffu);
+    uint32_t ma = a_zero ? 0u : (UINT32_C(0x800000) | (a & UINT32_C(0x7fffff)));
+    uint32_t mb = b_zero ? 0u : (UINT32_C(0x800000) | (b & UINT32_C(0x7fffff)));
+    uint32_t eae = a_zero ? 1u : ea;
+    uint32_t ebe = b_zero ? 1u : eb;
+    uint32_t swap = (eae < ebe) || ((eae == ebe) && (ma < mb));
+    uint32_t el = swap ? ebe : eae;
+    uint32_t es = swap ? eae : ebe;
+    uint32_t ml = swap ? mb : ma;
+    uint32_t ms = swap ? ma : mb;
+    uint32_t sbig = swap ? sbe : sa;
+    uint32_t ssmall = swap ? sa : sbe;
+    uint32_t same_sign = (sbig == ssmall);
+    uint32_t sres = sbig;
+    uint32_t ediff = el - es;
+    uint32_t msa = (ediff >= 24u) ? 0u : (ms >> ediff);
+    uint32_t sum = same_sign ? (ml + msa) : (ml - msa);
+    uint32_t mres;
+    int32_t eres;
+
+    if (a_special || b_special) {
+        if (a_special && b_special && (sa != sbe)) return 0u;
+        sres = a_special ? sa : sbe;
+        return (sres << 31) | UINT32_C(0x7f7fffff);
+    }
+    if (same_sign && ((sum & UINT32_C(0x1000000)) != 0u)) {
+        mres = sum >> 1;
+        eres = (int32_t)el + 1;
+    } else if ((sum & UINT32_C(0xffffff)) == 0u) {
+        return 0u;
+    } else if (same_sign) {
+        mres = sum & UINT32_C(0xffffff);
+        eres = (int32_t)el;
+    } else {
+        uint32_t lz = 0u;
+        uint32_t bit = UINT32_C(0x800000);
+        while ((sum & bit) == 0u) {
+            ++lz;
+            bit >>= 1;
+        }
+        mres = (sum << lz) & UINT32_C(0xffffff);
+        eres = (int32_t)el - (int32_t)lz;
+    }
+    if ((eres <= 0) || (mres == 0u)) return 0u;
+    if (eres >= 255) return (sres << 31) | UINT32_C(0x7f7fffff);
+    return (sres << 31) | ((uint32_t)eres << 23) | (mres & UINT32_C(0x7fffff));
+}
+
+static inline int cfar_fp32_gt(cfar_fp32_t a, cfar_fp32_t b)
+{
+    uint32_t a_zero = ((a & UINT32_C(0x7fffffff)) == 0u);
+    uint32_t b_zero = ((b & UINT32_C(0x7fffffff)) == 0u);
+    if (a_zero && b_zero) return 0;
+    if ((a >> 31) != (b >> 31)) return (int)(b >> 31);
+    if ((a >> 31) == 0u)
+        return (a & UINT32_C(0x7fffffff)) > (b & UINT32_C(0x7fffffff));
+    return (a & UINT32_C(0x7fffffff)) < (b & UINT32_C(0x7fffffff));
+}
+
+static inline cfar_fp32_t cfar_complex_power_lite(float re, float im)
+{
+    cfar_fp32_t re_bits = cfar_f32_bits(re);
+    cfar_fp32_t im_bits = cfar_f32_bits(im);
+    cfar_fp32_t rr = cfar_fp32_mul_lite(re_bits, re_bits);
+    cfar_fp32_t ii = cfar_fp32_mul_lite(im_bits, cfar_fp32_negate(im_bits));
+    return cfar_fp32_addsub_lite(rr, ii, 1u);
+}
+
+static inline cfar_fp32_t cfar_tree_sum_lite(cfar_fp32_t values[], uint32_t count)
+{
+    uint32_t inputs = count;
+    while (inputs > 1u) {
+        uint32_t outputs = (inputs + 1u) / 2u;
+        uint32_t i;
+        for (i = 0u; i < outputs; ++i) {
+            uint32_t first = 2u * i;
+            values[i] = (first + 1u < inputs) ?
+                        cfar_fp32_addsub_lite(values[first], values[first + 1u], 0u) :
+                        values[first];
+        }
+        inputs = outputs;
+    }
+    return values[0];
+}
+
 #define NSAMPLES 4096u
 #define NREPS      16u
 #define MAXW      64u
 #define NSEEDS      8u
 
 typedef struct {
-    uint32_t alpha;
+    float alpha;
     uint32_t tl;
     uint32_t tr;
     uint32_t gl;
@@ -20,31 +171,25 @@ typedef struct {
 } cfar_cfg_t;
 
 typedef struct {
-    int32_t re;
-    int32_t im;
+    float re;
+    float im;
 } cfar_sample_t;
 
-#if defined(__SIZEOF_INT128__)
-typedef unsigned __int128 cfar_acc_t;
-#else
-typedef uint64_t cfar_acc_t;
-#endif
-
 static const cfar_cfg_t kCfgs[] = {
-    {3u, 4u, 4u, 1u, 1u, "base"},
-    {2u, 6u, 6u, 1u, 1u, "wide_train_low_alpha"},
-    {4u, 8u, 8u, 2u, 2u, "wide_guard_high_alpha"},
-    {5u, 10u, 6u, 2u, 1u, "asymmetric_high_alpha"},
-    {1u, 12u, 12u, 3u, 3u, "very_permissive"},
-    {6u, 5u, 15u, 1u, 2u, "asymmetric_strict"},
-    {0u, 0u, 0u, 0u, 0u, "min_window_alpha0"},
-    {7u, 0u, 0u, 0u, 0u, "min_window_alpha7"},
-    {3u, 30u, 30u, 1u, 2u, "max_window_balanced"},
-    {2u, 31u, 28u, 2u, 2u, "max_window_asymmetric"},
-    {3u, 2u, 2u, 20u, 20u, "wide_guard_small_train"},
-    {4u, 20u, 20u, 0u, 0u, "high_train_no_guard"},
-    {3u, 0u, 16u, 1u, 1u, "right_train_only"},
-    {3u, 16u, 0u, 1u, 1u, "left_train_only"}
+    {3.0f, 4u, 4u, 1u, 1u, "base"},
+    {2.3f, 6u, 6u, 1u, 1u, "wide_train_fractional_alpha"},
+    {4.0f, 8u, 8u, 2u, 2u, "wide_guard_high_alpha"},
+    {5.5f, 10u, 6u, 2u, 1u, "asymmetric_high_alpha"},
+    {1.0f, 12u, 12u, 3u, 3u, "very_permissive"},
+    {6.0f, 5u, 15u, 1u, 2u, "asymmetric_strict"},
+    {0.0f, 0u, 0u, 0u, 0u, "min_window_alpha0"},
+    {7.0f, 0u, 0u, 0u, 0u, "min_window_alpha7"},
+    {3.0f, 30u, 30u, 1u, 2u, "max_window_balanced"},
+    {2.0f, 31u, 28u, 2u, 2u, "max_window_asymmetric"},
+    {3.0f, 2u, 2u, 20u, 20u, "wide_guard_small_train"},
+    {4.0f, 20u, 20u, 0u, 0u, "high_train_no_guard"},
+    {3.0f, 0u, 16u, 1u, 1u, "right_train_only"},
+    {3.0f, 16u, 0u, 1u, 1u, "left_train_only"}
 };
 
 static const uint64_t kSeeds[NSEEDS] = {
@@ -98,12 +243,14 @@ static inline void cfar_hw_set_guard(uint64_t l, uint64_t r)
 {
     __asm__ __volatile__(".insn r 0x7b, 0, 12, x0, %0, %1" : : "r"(l), "r"(r) : "memory");
 }
-static inline uint8_t cfar_hw_run(int32_t re, int32_t im)
+static inline uint8_t cfar_hw_run(float re, float im)
 {
     uint64_t rd;
+    uint64_t re_bits = (uint64_t)cfar_f32_bits(re);
+    uint64_t im_bits = (uint64_t)cfar_f32_bits(im);
     __asm__ __volatile__(".insn r 0x7b, 1, 16, %0, %1, %2"
                          : "=r"(rd)
-                         : "r"((int64_t)re), "r"((int64_t)im)
+                         : "r"(re_bits), "r"(im_bits)
                          : "memory");
     return (uint8_t)(rd & 0xffu);
 }
@@ -111,17 +258,6 @@ static inline uint8_t cfar_hw_run(int32_t re, int32_t im)
 static inline int32_t signed_10b(uint32_t v)
 {
     return (int32_t)(v & 0x3ffu) - 512;
-}
-
-static inline uint64_t square_s32(int32_t x)
-{
-    int64_t sx = (int64_t)x;
-    return (uint64_t)(sx * sx);
-}
-
-static inline uint64_t sample_power(cfar_sample_t x)
-{
-    return square_s32(x.re) + square_s32(x.im);
 }
 
 static void init_input(uint64_t seed, uint32_t pattern)
@@ -132,19 +268,21 @@ static void init_input(uint64_t seed, uint32_t pattern)
         s = lcg_next(s);
         switch (pattern & 3u) {
         case 0u:
-            in[i].re = signed_10b((uint32_t)(s >> 16));
-            in[i].im = signed_10b((uint32_t)(s >> 32));
+            in[i].re = (float)signed_10b((uint32_t)(s >> 16)) * (1.0f / 16.0f);
+            in[i].im = (float)signed_10b((uint32_t)(s >> 32)) * (1.0f / 16.0f);
             break;
         case 1u:
-            in[i].re = signed_10b(i * 37u + (i >> 2) * 13u + (uint32_t)(seed & 0x3ffu));
-            in[i].im = signed_10b(i * 19u + (i >> 3) * 29u + (uint32_t)((seed >> 16) & 0x3ffu));
+            in[i].re = (float)signed_10b(i * 37u + (i >> 2) * 13u +
+                                        (uint32_t)(seed & 0x3ffu)) * 0.125f;
+            in[i].im = (float)signed_10b(i * 19u + (i >> 3) * 29u +
+                                        (uint32_t)((seed >> 16) & 0x3ffu)) * 0.125f;
             break;
         case 2u: {
-            int32_t re = signed_10b((uint32_t)(s >> 20));
-            int32_t im = signed_10b((uint32_t)(s >> 36));
+            float re = (float)signed_10b((uint32_t)(s >> 20)) * 0.25f;
+            float im = (float)signed_10b((uint32_t)(s >> 36)) * 0.25f;
             if ((i & 31u) == 0u) {
-                re = 1023;
-                im = -1023;
+                re = 255.75f;
+                im = -255.75f;
             }
             if ((i & 127u) == 63u) {
                 re = 0;
@@ -155,8 +293,8 @@ static void init_input(uint64_t seed, uint32_t pattern)
             break;
         }
         default:
-            in[i].re = (i & 1u) ? 1023 : -1023;
-            in[i].im = (i & 2u) ? 511 : -511;
+            in[i].re = (i & 1u) ? 63.9375f : -63.9375f;
+            in[i].im = (i & 2u) ? 31.9375f : -31.9375f;
             break;
         }
     }
@@ -167,50 +305,105 @@ static uint32_t cfg_window_size(const cfar_cfg_t *cfg)
     return cfg->tl + cfg->tr + cfg->gl + cfg->gr + 1u;
 }
 
-static uint8_t cfar_sw_step(uint64_t w[MAXW], uint32_t *wcnt, uint8_t *det, cfar_sample_t x,
-                            const cfar_cfg_t *cfg)
+static cfar_fp32_t cfg_embedded_alpha(const cfar_cfg_t *cfg)
 {
-    uint32_t i;
-    uint32_t wsize = cfg_window_size(cfg);
-    uint32_t cut = cfg->tr + cfg->gr;
+    uint32_t training_total = cfg->tl + cfg->tr;
+    if (training_total == 0u) return 0u;
+    return cfar_f32_bits(cfg->alpha / (float)training_total);
+}
 
-    for (i = MAXW - 1u; i > 0u; --i) w[i] = w[i - 1u];
-    w[0] = sample_power(x);
+typedef struct {
+    float power[MAXW];
+    float training_sum;
+    uint32_t head;
+    uint32_t count;
+} cfar_sw_state_t;
 
-    if ((*wcnt + 1u) < wsize) {
-        *wcnt += 1u;
-        return *det;
+static inline uint32_t cfar_sw_ring_index(const cfar_sw_state_t *state,
+                                          uint32_t window_size,
+                                          uint32_t age)
+{
+    uint32_t index = state->head + age;
+    return (index < window_size) ? index : index - window_size;
+}
+
+static inline float cfar_sw_power(cfar_sample_t x)
+{
+    return x.re * x.re + x.im * x.im;
+}
+
+/*
+ * Conventional software CA-CFAR implementation.
+ *
+ * The newest sample is age zero.  Rather than shifting MAXW values and
+ * rebuilding a 64-input adder tree for every sample, keep a circular window
+ * and update the two training regions by adding their entering samples and
+ * subtracting their leaving samples.
+ */
+static uint8_t cfar_sw_step(cfar_sw_state_t *state,
+                            cfar_sample_t x,
+                            const cfar_cfg_t *cfg,
+                            float alpha_over_n)
+{
+    const uint32_t window_size = cfg_window_size(cfg);
+    const uint32_t cut = cfg->tr + cfg->gr;
+    const uint32_t left_begin = cut + 1u + cfg->gl;
+    const float new_power = cfar_sw_power(x);
+
+    if (state->count == 0u) {
+        state->head = 0u;
+    } else {
+        state->head = (state->head == 0u) ? window_size - 1u : state->head - 1u;
     }
 
-    {
-        cfar_acc_t acc = 0u;
-        uint32_t left_begin = cfg->tr + cfg->gr + 1u + cfg->gl;
-        uint32_t left_end = left_begin + cfg->tl;
-        uint32_t ttotal = cfg->tl + cfg->tr;
-        cfar_acc_t avg = 0u;
-        cfar_acc_t thr;
+    if (state->count < window_size) {
+        state->power[state->head] = new_power;
+        ++state->count;
 
-        for (i = 0; i < MAXW; ++i) {
-            if ((i < cfg->tr) || ((i >= left_begin) && (i < left_end))) acc += w[i];
+        if (state->count < window_size) return 0u;
+
+        state->training_sum = 0.0f;
+        for (uint32_t i = 0u; i < cfg->tr; ++i)
+            state->training_sum += state->power[cfar_sw_ring_index(state, window_size, i)];
+        for (uint32_t i = 0u; i < cfg->tl; ++i)
+            state->training_sum += state->power[cfar_sw_ring_index(state, window_size,
+                                                                    left_begin + i)];
+    } else {
+        float next_sum = state->training_sum;
+
+        /* The old window is still readable except for its oldest cell. */
+        if (cfg->tr != 0u) {
+            const uint32_t leaving_right =
+                cfar_sw_ring_index(state, window_size, cfg->tr);
+            next_sum += new_power - state->power[leaving_right];
         }
-        if (ttotal != 0u) avg = acc / ttotal;
-        thr = avg * (cfar_acc_t)cfg->alpha;
-        *det = ((cfar_acc_t)w[cut] > thr) ? 1u : 0u;
+        if (cfg->tl != 0u) {
+            const uint32_t entering_left =
+                cfar_sw_ring_index(state, window_size, left_begin);
+            const uint32_t leaving_left = state->head;
+            next_sum += state->power[entering_left] - state->power[leaving_left];
+        }
+
+        state->power[state->head] = new_power;
+        state->training_sum = next_sum;
     }
 
-    return *det;
+    return state->power[cfar_sw_ring_index(state, window_size, cut)] >
+           state->training_sum * alpha_over_n;
 }
 
 static uint64_t run_sw(const cfar_cfg_t *cfg)
 {
     uint64_t sum = 0u;
     uint32_t rep, i;
-    uint64_t w[MAXW];
+    const uint32_t training_total = cfg->tl + cfg->tr;
+    const float alpha_over_n = (training_total == 0u) ? 0.0f :
+                               cfg->alpha / (float)training_total;
+
     for (rep = 0; rep < NREPS; ++rep) {
-        uint32_t wcnt = 0u;
-        uint8_t det = 0u;
-        for (i = 0; i < MAXW; ++i) w[i] = 0u;
-        for (i = 0; i < NSAMPLES; ++i) sum = mix(sum, cfar_sw_step(w, &wcnt, &det, in[i], cfg));
+        cfar_sw_state_t state = {0};
+        for (i = 0; i < NSAMPLES; ++i)
+            sum = mix(sum, cfar_sw_step(&state, in[i], cfg, alpha_over_n));
     }
     return sum;
 }
@@ -219,7 +412,8 @@ static uint64_t run_hw(const cfar_cfg_t *cfg)
 {
     uint64_t sum = 0u;
     uint32_t rep, i;
-    cfar_hw_set_alpha(cfg->alpha);
+    cfar_fp32_t embedded_alpha = cfg_embedded_alpha(cfg);
+    cfar_hw_set_alpha(embedded_alpha);
     cfar_hw_set_training(cfg->tl, cfg->tr);
     cfar_hw_set_guard(cfg->gl, cfg->gr);
     for (rep = 0; rep < NREPS; ++rep) {
@@ -257,8 +451,10 @@ int main(void)
 
             test_id += 1u;
             init_input(seed, pattern);
-            printf("test %u/%u cfg=%u/%u \"%s\" alpha=%u tl=%u tr=%u gl=%u gr=%u win=%u pattern=%u seed[%u]=0x%016" PRIx64 "\n",
-                   test_id, NTESTS, c + 1u, NCASES, cfg->name, cfg->alpha, cfg->tl, cfg->tr,
+            printf("test %u/%u cfg=%u/%u \"%s\" alpha_bits=0x%08" PRIx32
+                   " alpha_over_n_bits=0x%08" PRIx32 " tl=%u tr=%u gl=%u gr=%u win=%u pattern=%u seed[%u]=0x%016" PRIx64 "\n",
+                   test_id, NTESTS, c + 1u, NCASES, cfg->name,
+                   cfar_f32_bits(cfg->alpha), cfg_embedded_alpha(cfg), cfg->tl, cfg->tr,
                    cfg->gl, cfg->gr, wsize, pattern, s, seed);
 
             t0 = rdcycle64();
@@ -279,12 +475,13 @@ int main(void)
             printf("  SW checksum: 0x%016" PRIx64 "\n", sw_sum);
             printf("  HW checksum: 0x%016" PRIx64 "\n", hw_sum);
             printf("  SW cycles : %" PRIu64 " (%" PRIu64 ".%03" PRIu64 " cyc/op)\n",
-                   sw_cyc, sw_cyc / ops, ((sw_cyc % ops) * 1000ULL) / ops);
+                   sw_cyc, sw_cyc / ops, ((sw_cyc % ops) * (uint64_t)1000u) / ops);
             printf("  HW cycles : %" PRIu64 " (%" PRIu64 ".%03" PRIu64 " cyc/op)\n",
-                   hw_cyc, hw_cyc / ops, ((hw_cyc % ops) * 1000ULL) / ops);
+                   hw_cyc, hw_cyc / ops, ((hw_cyc % ops) * (uint64_t)1000u) / ops);
             if (hw_cyc != 0u) {
-                uint64_t sp = (sw_cyc * 1000ULL) / hw_cyc;
-                printf("  Speedup HW/SW: %" PRIu64 ".%03" PRIu64 "x\n", sp / 1000ULL, sp % 1000ULL);
+                uint64_t sp = (sw_cyc * (uint64_t)1000u) / hw_cyc;
+                printf("  Speedup HW/SW: %" PRIu64 ".%03" PRIu64 "x\n",
+                       sp / (uint64_t)1000u, sp % (uint64_t)1000u);
             }
 
             if (sw_sum != hw_sum) {
@@ -298,13 +495,15 @@ int main(void)
     sink = total_sum ^ total_sw_cyc ^ total_hw_cyc;
     printf("Aggregate ops: %" PRIu64 "\n", total_ops);
     printf("Aggregate SW cycles: %" PRIu64 " (%" PRIu64 ".%03" PRIu64 " cyc/op)\n",
-           total_sw_cyc, total_sw_cyc / total_ops, ((total_sw_cyc % total_ops) * 1000ULL) / total_ops);
+           total_sw_cyc, total_sw_cyc / total_ops,
+           ((total_sw_cyc % total_ops) * (uint64_t)1000u) / total_ops);
     printf("Aggregate HW cycles: %" PRIu64 " (%" PRIu64 ".%03" PRIu64 " cyc/op)\n",
-           total_hw_cyc, total_hw_cyc / total_ops, ((total_hw_cyc % total_ops) * 1000ULL) / total_ops);
+           total_hw_cyc, total_hw_cyc / total_ops,
+           ((total_hw_cyc % total_ops) * (uint64_t)1000u) / total_ops);
     if (total_hw_cyc != 0u) {
-        uint64_t sp_total = (total_sw_cyc * 1000ULL) / total_hw_cyc;
+        uint64_t sp_total = (total_sw_cyc * (uint64_t)1000u) / total_hw_cyc;
         printf("Aggregate speedup HW/SW: %" PRIu64 ".%03" PRIu64 "x\n",
-               sp_total / 1000ULL, sp_total % 1000ULL);
+               sp_total / (uint64_t)1000u, sp_total % (uint64_t)1000u);
     }
 
     printf("PASS (all %u tests)\n", NTESTS);

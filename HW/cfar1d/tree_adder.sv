@@ -1,7 +1,7 @@
 module tree_adder #(
     parameter int N = 8,
     parameter int DATA_WIDTH = 32,
-    parameter int SUM_WIDTH = DATA_WIDTH + ((N <= 1) ? 0 : $clog2(N))
+    parameter int SUM_WIDTH = 32
 ) (
     input  logic                  clk,
     input  logic                  rst_n,
@@ -43,12 +43,13 @@ module tree_adder #(
                     if ((2 * node_i + 1) < INPUTS) begin : gen_add
                         logic [SUM_WIDTH-1:0] add_sum;
 
-                        adder #(
-                            .WIDTH(SUM_WIDTH)
-                        ) u_adder (
-                            .a(stage[level_i][2 * node_i]),
-                            .b(stage[level_i][2 * node_i + 1]),
-                            .sum(add_sum)
+                        fp_addsub32_lite u_adder (
+                            .clk(clk),
+                            .rst_n(rst_n),
+                            .a_i(stage[level_i][2 * node_i]),
+                            .b_i(stage[level_i][2 * node_i + 1]),
+                            .sub_i(1'b0),
+                            .res_o(add_sum)
                         );
 
                         always_ff @(posedge clk or negedge rst_n) begin
@@ -95,5 +96,11 @@ module tree_adder #(
             assign valid_out = valid_pipe[STAGES - 1];
         end
     endgenerate
+
+    initial begin
+        if ((DATA_WIDTH != 32) || (SUM_WIDTH != 32)) begin
+            $error("tree_adder only supports IEEE-754 FP32 (DATA_WIDTH=SUM_WIDTH=32)");
+        end
+    end
 
 endmodule
