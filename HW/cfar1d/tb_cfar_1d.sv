@@ -43,7 +43,7 @@ module tb_cfar_1d;
         reset_window = 1'b1;
         @(posedge clk);
         #1;
-        if (!done || detection_map != 0) $fatal(1, "reset_window incorrecto");
+        if (done || detection_map != 0) $fatal(1, "reset_window incorrecto");
         @(negedge clk);
         reset_window = 1'b0;
         tl = left_training; tr = right_training;
@@ -57,9 +57,10 @@ module tb_cfar_1d;
     task automatic push(input shortreal re, im, input string label);
         real training_sum, expected_threshold, cut_power;
         logic expected;
+        logic sliding_update;
         int waited;
 
-        if (!done) $fatal(1, "%s: DUT ocupado antes de start", label);
+        sliding_update = (model_count >= window_size);
         @(negedge clk);
         data_in_re = f32(re);
         data_in_im = f32(im);
@@ -82,6 +83,8 @@ module tb_cfar_1d;
             waited++;
         end
         if (!done) $fatal(1, "%s: timeout", label);
+        if (sliding_update && waited > 6)
+            $fatal(1, "%s: latencia deslizante inesperada: %0d ciclos", label, waited);
 
         if (model_count >= window_size) begin
             training_sum = 0.0;
@@ -121,7 +124,7 @@ module tb_cfar_1d;
         repeat (3) @(posedge clk);
         rst_n = 1'b1;
         @(posedge clk); #1;
-        if (!done) $fatal(1, "done no esta alto tras reset");
+        if (done) $fatal(1, "done debe ser un pulso y estar bajo tras reset");
 
         // Original alpha=2.0 and four training cells: software supplies 0.5.
         // sum=400, threshold=200. A second /4 in hardware would fail the miss.
@@ -133,12 +136,25 @@ module tb_cfar_1d;
 
         // Asymmetric selection and fractional FP32 samples.
         configure(0.25, 3, 1, 0, 2);
-        repeat (14) begin
+        repeat (512) begin
             push(shortreal'(($urandom_range(2, 12)) * 0.5),
                  shortreal'(($urandom_range(0, 6)) * 0.25), "asimetrico");
         end
 
-        if (checks < 4) $fatal(1, "checks insuficientes: %0d", checks);
+        // Exercise each sliding training region independently.
+        configure(0.1875, 0, 6, 1, 2);
+        repeat (256) begin
+            push(shortreal'(($urandom_range(1, 15)) * 0.5),
+                 shortreal'(($urandom_range(0, 8)) * 0.25), "solo derecha");
+        end
+
+        configure(0.1875, 6, 0, 2, 1);
+        repeat (256) begin
+            push(shortreal'(($urandom_range(1, 15)) * 0.5),
+                 shortreal'(($urandom_range(0, 8)) * 0.25), "solo izquierda");
+        end
+
+        if (checks < 900) $fatal(1, "checks insuficientes: %0d", checks);
         $display("All cfar_1d FP32 complex tests passed: checks=%0d", checks);
         $finish;
     end

@@ -29,10 +29,8 @@ module cfar_1d #(
     logic [MAX_WINDOW_CELLS-1:0][31:0] window;
 
     logic [31:0] training_inputs [MAX_WINDOW_CELLS-1:0];
-    logic [31:0] training_sum;
-    // Kept as training_average for interface/readability continuity. There is
-    // no divider: it contains the sum and active_alpha contains alpha/N.
-    logic [31:0] training_average;
+    logic [31:0] training_sum_tree;
+    logic [31:0] training_sum_q;
     logic [31:0] threshold;
     logic        training_sum_valid_in;
     logic        training_sum_valid_out;
@@ -45,6 +43,20 @@ module cfar_1d #(
     logic [31:0] active_alpha;
     logic [WINDOW_COUNT_WIDTH-1:0] active_cut;
 
+    logic [WINDOW_COUNT_WIDTH-1:0] left_begin;
+    logic [31:0] right_entering;
+    logic [31:0] right_leaving;
+    logic [31:0] left_entering;
+    logic [31:0] left_leaving;
+    logic [31:0] right_delta;
+    logic [31:0] left_delta;
+    logic [31:0] right_delta_q;
+    logic [31:0] left_delta_q;
+    logic [31:0] delta_total;
+    logic [31:0] delta_total_q;
+    logic [31:0] updated_training_sum;
+    logic        training_sum_initialized;
+
     logic        power_valid_in;
     logic        power_valid_out;
     logic [31:0] input_power;
@@ -52,7 +64,8 @@ module cfar_1d #(
     logic [31:0] conjugate_im;
 
     typedef enum logic [2:0] {
-        IDLE, POWER_WAIT, SUM_START, SUM_WAIT, DETECTION
+        IDLE, POWER_WAIT, REBASE_START, REBASE_WAIT,
+        DELTA_SUM, SUM_UPDATE, DETECTION
     } state_t;
     state_t state;
 
@@ -76,11 +89,57 @@ module cfar_1d #(
     assign window_size = training_cells_left + training_cells_right +
                          guard_cells_left + guard_cells_right + 1;
     assign cut = training_cells_right + guard_cells_right;
-    assign training_sum_valid_in = (state == SUM_START);
+    assign left_begin = training_cells_right + guard_cells_right + 1 +
+                        guard_cells_left;
+    assign training_sum_valid_in = (state == REBASE_START);
     assign training_tree_rst_n = rst_n & ~reset_window;
     assign power_valid_in = start & (state == IDLE);
     assign conjugate_im = (data_in_im[30:0] == 31'd0) ? 32'd0 :
                           {~data_in_im[31], data_in_im[30:0]};
+
+    // Sliding-window deltas are formed from the old window while input_power
+    // is the sample that will become window[0].  Both training regions are
+    // updated in parallel and then folded into training_sum_q in two short
+    // registered stages.
+    always_comb begin
+        right_entering = 32'd0;
+        right_leaving  = 32'd0;
+        left_entering  = 32'd0;
+        left_leaving   = 32'd0;
+
+        if (training_cells_right != 0) begin
+            right_entering = input_power;
+            right_leaving = window[training_cells_right - 1];
+        end
+        if (training_cells_left != 0) begin
+            left_entering = window[left_begin - 1];
+            left_leaving = window[window_size - 1];
+        end
+    end
+
+    fp_addsub32_lite right_delta_add (
+        .clk(clk), .rst_n(training_tree_rst_n),
+        .a_i(right_entering), .b_i(right_leaving), .sub_i(1'b1),
+        .res_o(right_delta)
+    );
+
+    fp_addsub32_lite left_delta_add (
+        .clk(clk), .rst_n(training_tree_rst_n),
+        .a_i(left_entering), .b_i(left_leaving), .sub_i(1'b1),
+        .res_o(left_delta)
+    );
+
+    fp_addsub32_lite delta_total_add (
+        .clk(clk), .rst_n(training_tree_rst_n),
+        .a_i(right_delta_q), .b_i(left_delta_q), .sub_i(1'b0),
+        .res_o(delta_total)
+    );
+
+    fp_addsub32_lite training_sum_update_add (
+        .clk(clk), .rst_n(training_tree_rst_n),
+        .a_i(training_sum_q), .b_i(delta_total_q), .sub_i(1'b0),
+        .res_o(updated_training_sum)
+    );
 
     // x * conj(x) = (re^2 + im^2) + j0. The generic complex multiplier is
     // explicitly split into the requested product and add/subtract stages.
@@ -112,21 +171,20 @@ module cfar_1d #(
         .N(MAX_WINDOW_CELLS),
         .DATA_WIDTH(32),
         .SUM_WIDTH(32)
-    ) training_sum_tree (
+    ) training_sum_tree_i (
         .clk(clk),
         .rst_n(training_tree_rst_n),
         .valid_in(training_sum_valid_in),
         .a(training_inputs),
-        .sum(training_sum),
+        .sum(training_sum_tree),
         .valid_out(training_sum_valid_out)
     );
 
-    // active_alpha is alpha/Ntraining, so training_average is intentionally
-    // the unnormalised sum and no hardware divider is inferred.
+    // active_alpha is alpha/Ntraining; no divider is inferred in hardware.
     fp_mul32_lite threshold_mul (
         .clk(clk),
         .rst_n(training_tree_rst_n),
-        .a_i(training_average),
+        .a_i(training_sum_q),
         .b_i(active_alpha),
         .res_o(threshold)
     );
@@ -134,11 +192,15 @@ module cfar_1d #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state                         <= IDLE;
-            done                          <= 1'b1;
+            done                          <= 1'b0;
             detection_map                 <= '0;
             window_cnt                    <= '0;
             window                        <= '0;
-            training_average              <= '0;
+            training_sum_q                 <= '0;
+            right_delta_q                  <= '0;
+            left_delta_q                   <= '0;
+            delta_total_q                  <= '0;
+            training_sum_initialized       <= 1'b0;
             active_training_cells_left    <= '0;
             active_training_cells_right   <= '0;
             active_guard_cells_left       <= '0;
@@ -147,11 +209,15 @@ module cfar_1d #(
             active_cut                    <= '0;
         end else if (reset_window) begin
             state                         <= IDLE;
-            done                          <= 1'b1;
+            done                          <= 1'b0;
             detection_map                 <= '0;
             window_cnt                    <= '0;
             window                        <= '0;
-            training_average              <= '0;
+            training_sum_q                 <= '0;
+            right_delta_q                  <= '0;
+            left_delta_q                   <= '0;
+            delta_total_q                  <= '0;
+            training_sum_initialized       <= 1'b0;
             active_training_cells_left    <= '0;
             active_training_cells_right   <= '0;
             active_guard_cells_left       <= '0;
@@ -159,17 +225,16 @@ module cfar_1d #(
             active_alpha                  <= '0;
             active_cut                    <= '0;
         end else begin
+            // Completion is a pulse, not an idle level.  The CV-X-IF wrapper
+            // consumes it directly without another edge detector/register.
+            done <= 1'b0;
+
             case (state)
                 IDLE: begin
-                    done <= 1'b1;
-                    if (start) begin
-                        done  <= 1'b0;
-                        state <= POWER_WAIT;
-                    end
+                    if (start) state <= POWER_WAIT;
                 end
 
                 POWER_WAIT: begin
-                    done <= 1'b0;
                     if (power_valid_out) begin
                         window <= {window[MAX_WINDOW_CELLS-2:0], input_power};
                         if (window_cnt + 1 < window_size) begin
@@ -183,22 +248,41 @@ module cfar_1d #(
                             active_guard_cells_right    <= guard_cells_right;
                             active_alpha                <= alpha;
                             active_cut                  <= cut;
-                            state                       <= SUM_START;
+                            window_cnt                  <= window_size;
+
+                            if (!training_sum_initialized) begin
+                                // Seed the accumulator once from the full
+                                // reduction; subsequent samples are O(1).
+                                state <= REBASE_START;
+                            end else begin
+                                right_delta_q <= right_delta;
+                                left_delta_q  <= left_delta;
+                                state         <= DELTA_SUM;
+                            end
                         end
                     end
                 end
 
-                SUM_START: begin
-                    done  <= 1'b0;
-                    state <= SUM_WAIT;
+                REBASE_START: begin
+                    state <= REBASE_WAIT;
                 end
 
-                SUM_WAIT: begin
-                    done <= 1'b0;
+                REBASE_WAIT: begin
                     if (training_sum_valid_out) begin
-                        training_average <= training_sum;
-                        state            <= DETECTION;
+                        training_sum_q           <= training_sum_tree;
+                        training_sum_initialized <= 1'b1;
+                        state                    <= DETECTION;
                     end
+                end
+
+                DELTA_SUM: begin
+                    delta_total_q <= delta_total;
+                    state         <= SUM_UPDATE;
+                end
+
+                SUM_UPDATE: begin
+                    training_sum_q <= updated_training_sum;
+                    state          <= DETECTION;
                 end
 
                 DETECTION: begin
@@ -207,10 +291,7 @@ module cfar_1d #(
                     state         <= IDLE;
                 end
 
-                default: begin
-                    state <= IDLE;
-                    done  <= 1'b1;
-                end
+                default: state <= IDLE;
             endcase
         end
     end

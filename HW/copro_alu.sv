@@ -59,8 +59,7 @@ module copro_alu
 
   logic cfar_busy_q;
   logic cfar_wb_pending_q;
-  logic cfar_done_prev_q;
-  logic cfar_done_pulse;
+  logic cfar_complete;
 
   logic [4:0] cfar_rd_q;
   hartid_t cfar_hartid_q;
@@ -78,15 +77,18 @@ module copro_alu
   logic [31:0] rs1_word;
   logic [31:0] rs2_word;
 
-  assign result_o = result_q;
-  assign hartid_o = hartid_q;
-  assign id_o     = id_q;
-  assign valid_o  = valid_q;
-  assign rd_o     = rd_q;
-  assign we_o     = we_q;
-  assign busy_o   = cfar_busy_q;
+  assign cfar_complete = cfar_done_w && cfar_wb_pending_q;
 
-  assign cfar_done_pulse = cfar_done_w && ~cfar_done_prev_q;
+  // CFAR completion is already a registered one-cycle pulse.  Drive it
+  // straight onto the CV-X-IF result channel instead of detecting its edge
+  // and registering the same result for an additional cycle.
+  assign result_o = cfar_complete ? {{(XLEN-8){1'b0}}, cfar_detection_map_w} : result_q;
+  assign hartid_o = cfar_complete ? cfar_hartid_q : hartid_q;
+  assign id_o     = cfar_complete ? cfar_id_q : id_q;
+  assign valid_o  = cfar_complete ? 1'b1 : valid_q;
+  assign rd_o     = cfar_complete ? cfar_rd_q : rd_q;
+  assign we_o     = cfar_complete ? 1'b1 : we_q;
+  assign busy_o   = cfar_busy_q && !cfar_complete;
 
   always_comb begin
     rs1_word = '0;
@@ -137,15 +139,7 @@ module copro_alu
     rd_n     = '0;
     we_n     = 1'b0;
 
-    if (cfar_done_pulse && cfar_wb_pending_q) begin
-      result_n[7:0] = cfar_detection_map_w;
-      hartid_n = cfar_hartid_q;
-      id_n     = cfar_id_q;
-      valid_n  = 1'b1;
-      rd_n     = cfar_rd_q;
-      we_n     = 1'b1;
-    end else begin
-      case (opcode_i)
+    case (opcode_i)
         cvxif_instr_pkg::CFAR_RESET_WINDOW: begin
           if (issue_fire_i) begin
             cfar_reset_window = 1'b1;
@@ -192,13 +186,14 @@ module copro_alu
           end
         end
         cvxif_instr_pkg::CFAR_RUN: begin
-          cfar_start = issue_fire_i && ~cfar_busy_q;
+          // A new sample may be accepted in the same cycle in which the
+          // previous result is returned.
+          cfar_start = issue_fire_i && (!cfar_busy_q || cfar_complete);
         end
-        default: begin
-          result_n = '0;
-        end
-      endcase
-    end
+      default: begin
+        result_n = '0;
+      end
+    endcase
   end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -228,13 +223,10 @@ module copro_alu
       guard_cells_right_q <= '0;
       cfar_busy_q <= 1'b0;
       cfar_wb_pending_q <= 1'b0;
-      cfar_done_prev_q <= 1'b0;
       cfar_rd_q <= '0;
       cfar_hartid_q <= '0;
       cfar_id_q <= '0;
     end else begin
-      cfar_done_prev_q <= cfar_done_w;
-
       if (cfg_alpha_en) begin
         alpha_q <= cfg_alpha_data;
       end
@@ -252,17 +244,19 @@ module copro_alu
         cfar_wb_pending_q <= 1'b0;
       end
 
+      if (cfar_done_w) begin
+        cfar_busy_q <= 1'b0;
+        cfar_wb_pending_q <= 1'b0;
+      end
+
+      // Deliberately after completion: back-to-back completion/issue keeps
+      // the newly accepted transaction pending.
       if (cfar_start) begin
         cfar_busy_q <= 1'b1;
         cfar_wb_pending_q <= 1'b1;
         cfar_rd_q <= rd_i;
         cfar_hartid_q <= hartid_i;
         cfar_id_q <= id_i;
-      end
-
-      if (cfar_done_pulse) begin
-        cfar_busy_q <= 1'b0;
-        cfar_wb_pending_q <= 1'b0;
       end
     end
   end
