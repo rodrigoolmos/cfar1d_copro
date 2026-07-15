@@ -88,7 +88,10 @@ module copro_alu
   assign valid_o  = cfar_complete ? 1'b1 : valid_q;
   assign rd_o     = cfar_complete ? cfar_rd_q : rd_q;
   assign we_o     = cfar_complete ? 1'b1 : we_q;
-  assign busy_o   = cfar_busy_q && !cfar_complete;
+  // Keep the issue interface stalled during the completion cycle.  cfar_1d
+  // is still in DETECTION in that cycle and cannot sample a new start until
+  // it reaches IDLE on the following clock edge.
+  assign busy_o   = cfar_busy_q;
 
   always_comb begin
     rs1_word = '0;
@@ -186,9 +189,7 @@ module copro_alu
           end
         end
         cvxif_instr_pkg::CFAR_RUN: begin
-          // A new sample may be accepted in the same cycle in which the
-          // previous result is returned.
-          cfar_start = issue_fire_i && (!cfar_busy_q || cfar_complete);
+          cfar_start = issue_fire_i && !cfar_busy_q;
         end
       default: begin
         result_n = '0;
@@ -249,8 +250,6 @@ module copro_alu
         cfar_wb_pending_q <= 1'b0;
       end
 
-      // Deliberately after completion: back-to-back completion/issue keeps
-      // the newly accepted transaction pending.
       if (cfar_start) begin
         cfar_busy_q <= 1'b1;
         cfar_wb_pending_q <= 1'b1;
